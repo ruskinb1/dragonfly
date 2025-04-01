@@ -264,6 +264,24 @@ OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, Inc
   return OpStatus::OK;
 }
 
+template <typename DelFunc> struct DelEmptyHSet {
+  explicit DelEmptyHSet(DelFunc df) : f{df} {
+  }
+
+  void arm_deletion() {
+    will_delete = true;
+  }
+
+  ~DelEmptyHSet() {
+    if (will_delete) {
+      f();
+    }
+  }
+
+  DelFunc f;
+  bool will_delete{false};
+};
+
 OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t* cursor,
                            const ScanOpts& scan_op) {
   constexpr size_t HASH_TABLE_ENTRIES_FACTOR = 2;  // return key/value
@@ -274,12 +292,20 @@ OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t
    * of returning no or very few elements. (taken from redis code at db.c line 904 */
   constexpr size_t INTERATION_FACTOR = 10;
 
-  auto find_res = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
+  DbSlice& db_slice = op_args.GetDbSlice();
+  auto find_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (!find_res) {
     DVLOG(1) << "ScanOp: find failed: " << find_res << ", baling out";
     return find_res.status();
   }
+
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    if (auto it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); it) {
+      it->post_updater.Cancel();
+      db_slice.Del(op_args.db_cntx, it->it);
+    }
+  }};
 
   auto it = find_res.value();
   StringVec res;
@@ -328,6 +354,10 @@ OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t
     do {
       *cursor = sm->Scan(*cursor, scanCb);
     } while (*cursor && max_iterations-- && res.size() < count);
+
+    if (sm->Empty()) {
+      delete_empty_key.arm_deletion();
+    }
   }
 
   return res;
@@ -342,11 +372,15 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
   if (!it_res)
     return it_res.status();
 
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    it_res->post_updater.Cancel();
+    db_slice.Del(op_args.db_cntx, it_res->it);
+  }};
+
   PrimeValue& pv = it_res->it->second;
   op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, pv);
 
   unsigned deleted = 0;
-  bool key_remove = false;
   unsigned enc = pv.Encoding();
 
   if (enc == kEncodingListPack) {
@@ -357,7 +391,7 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
         ++deleted;
         lp = res.first;
         if (lpLength(lp) == 0) {
-          key_remove = true;
+          delete_empty_key.arm_deletion();
           break;
         }
       }
@@ -371,8 +405,8 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
       bool res = sm->Erase(ToSV(s));
       if (res) {
         ++deleted;
-        if (sm->UpperBoundSize() == 0) {
-          key_remove = true;
+        if (sm->Empty()) {
+          delete_empty_key.arm_deletion();
           break;
         }
       }
@@ -381,12 +415,8 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
 
   it_res->post_updater.Run();
 
-  if (!key_remove)
+  if (!delete_empty_key.will_delete)
     op_args.shard->search_indices()->AddDoc(key, op_args.db_cntx, pv);
-
-  if (key_remove) {
-    db_slice.Del(op_args.db_cntx, it_res->it);
-  }
 
   return deleted;
 }
@@ -476,17 +506,28 @@ OpResult<int> OpExist(const OpArgs& op_args, string_view key, string_view field)
     return it_res.status();
   }
 
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    if (auto it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); it) {
+      it->post_updater.Cancel();
+      db_slice.Del(op_args.db_cntx, it->it);
+    }
+  }};
+
   const PrimeValue& pv = (*it_res)->second;
-  void* ptr = pv.RObjPtr();
+  auto* lp = static_cast<uint8_t*>(pv.RObjPtr());
+
   if (pv.Encoding() == kEncodingListPack) {
     uint8_t intbuf[LP_INTBUF_SIZE];
-    optional<string_view> res = LpFind((uint8_t*)ptr, field, intbuf);
+    optional<string_view> res = LpFind(lp, field, intbuf);
     return res.has_value();
   }
 
   DCHECK_EQ(kEncodingStrMap2, pv.Encoding());
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
+  if (sm->Empty()) {
+    delete_empty_key.arm_deletion();
+  }
   return sm->Contains(field) ? 1 : 0;
 };
 
@@ -497,11 +538,18 @@ OpResult<string> OpGet(const OpArgs& op_args, string_view key, string_view field
     return it_res.status();
 
   const PrimeValue& pv = (*it_res)->second;
-  void* ptr = pv.RObjPtr();
+  auto* lp = static_cast<uint8_t*>(pv.RObjPtr());
+
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    if (auto it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); it) {
+      it->post_updater.Cancel();
+      db_slice.Del(op_args.db_cntx, it->it);
+    }
+  }};
 
   if (pv.Encoding() == kEncodingListPack) {
     uint8_t intbuf[LP_INTBUF_SIZE];
-    optional<string_view> res = LpFind((uint8_t*)ptr, field, intbuf);
+    optional<string_view> res = LpFind(lp, field, intbuf);
     if (!res) {
       return OpStatus::KEY_NOTFOUND;
     }
@@ -510,6 +558,11 @@ OpResult<string> OpGet(const OpArgs& op_args, string_view key, string_view field
 
   DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
+
+  if (sm->Empty()) {
+    delete_empty_key.arm_deletion();
+  }
+
   auto it = sm->Find(field);
 
   if (it == sm->end())
@@ -531,6 +584,13 @@ OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_
 
   vector<string> res;
   bool keyval = (mask == (FIELDS | VALUES));
+
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    if (auto it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); it) {
+      it->post_updater.Cancel();
+      db_slice.Del(op_args.db_cntx, it->it);
+    }
+  }};
 
   if (pv.Encoding() == kEncodingListPack) {
     uint8_t* lp = (uint8_t*)pv.RObjPtr();
@@ -570,10 +630,7 @@ OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_
   // and the enconding is guaranteed to be a DenseSet since we only support expiring
   // value with that enconding.
   if (res.empty()) {
-    // post_updater will run immediately
-    auto it = db_slice.FindMutable(op_args.db_cntx, key).it;
-
-    db_slice.Del(op_args.db_cntx, it);
+    delete_empty_key.arm_deletion();
   }
 
   return res;
@@ -589,6 +646,13 @@ OpResult<size_t> OpStrLen(const OpArgs& op_args, string_view key, string_view fi
     return it_res.status();
   }
 
+  auto delete_empty_key = DelEmptyHSet{[&] {
+    if (auto it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH); it) {
+      it->post_updater.Cancel();
+      db_slice.Del(op_args.db_cntx, it->it);
+    }
+  }};
+
   const PrimeValue& pv = (*it_res)->second;
   void* ptr = pv.RObjPtr();
   if (pv.Encoding() == kEncodingListPack) {
@@ -600,6 +664,9 @@ OpResult<size_t> OpStrLen(const OpArgs& op_args, string_view key, string_view fi
 
   DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
+  if (sm->Empty()) {
+    delete_empty_key.arm_deletion();
+  }
 
   auto it = sm->Find(field);
   return it != sm->end() ? sdslen(it->second) : 0;
